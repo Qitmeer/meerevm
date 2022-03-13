@@ -12,13 +12,13 @@ import (
 	qtypes "github.com/Qitmeer/qng-core/core/types"
 	"github.com/Qitmeer/qng-core/rpc/api"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 	"math/big"
@@ -26,7 +26,8 @@ import (
 )
 
 type MeerChain struct {
-	chain *ETHChain
+	chain    *ETHChain
+	meerpool *MeerPool
 }
 
 func (b *MeerChain) CheckConnectBlock(block qconsensus.Block) error {
@@ -118,7 +119,7 @@ func (b *MeerChain) buildBlock(qtxs []qconsensus.Tx, timestamp int64) (*types.Bl
 		return nil, nil, err
 	}
 
-	header := makeHeader(chainreader, parent, statedb, engine, timestamp)
+	header := makeHeader(&b.chain.Config().Eth, parent, statedb, timestamp)
 
 	if config.DAOForkSupport && config.DAOForkBlock != nil && config.DAOForkBlock.Cmp(header.Number) == 0 {
 		misc.ApplyDAOHardFork(statedb)
@@ -275,33 +276,43 @@ func (b *MeerChain) RegisterAPIs(apis []api.API) {
 	b.chain.Node().RegisterAPIs(eapis)
 }
 
-func NewMeerChain(chain *ETHChain) *MeerChain {
-	mc := &MeerChain{chain: chain}
+func (b *MeerChain) Start() {
+	b.meerpool.start()
+}
+
+func (b *MeerChain) Stop() {
+	b.meerpool.stop()
+}
+
+func (b *MeerChain) MeerPool() *MeerPool {
+	return b.meerpool
+}
+
+func NewMeerChain(chain *ETHChain, ctx qconsensus.Context) *MeerChain {
+	mc := &MeerChain{
+		chain:    chain,
+		meerpool: newMeerPool(&chain.config.Eth.Miner, chain.config.Eth.Genesis.Config, chain.ether.Engine(), chain.ether, chain.ether.EventMux(), ctx),
+	}
 	return mc
 }
 
-func makeHeader(chain consensus.ChainReader, parent *types.Block, state *state.StateDB, engine consensus.Engine, timestamp int64) *types.Header {
+func makeHeader(cfg *ethconfig.Config, parent *types.Block, state *state.StateDB, timestamp int64) *types.Header {
 	ptt := int64(parent.Time())
 	if timestamp <= ptt {
 		timestamp = ptt + 1
 	}
 	header := &types.Header{
-		Root:       state.IntermediateRoot(chain.Config().IsEIP158(parent.Number())),
+		Root:       state.IntermediateRoot(cfg.Genesis.Config.IsEIP158(parent.Number())),
 		ParentHash: parent.Hash(),
 		Coinbase:   parent.Coinbase(),
-		Difficulty: engine.CalcDifficulty(chain, uint64(timestamp), &types.Header{
-			Number:     parent.Number(),
-			Time:       parent.Time(),
-			Difficulty: parent.Difficulty(),
-			UncleHash:  parent.UncleHash(),
-		}),
-		GasLimit: parent.GasLimit(),
-		Number:   new(big.Int).Add(parent.Number(), common.Big1),
-		Time:     uint64(timestamp),
+		Difficulty: common.Big1,
+		GasLimit:   core.CalcGasLimit(parent.GasLimit(), cfg.Miner.GasCeil),
+		Number:     new(big.Int).Add(parent.Number(), common.Big1),
+		Time:       uint64(timestamp),
 	}
-	if chain.Config().IsLondon(header.Number) {
-		header.BaseFee = misc.CalcBaseFee(chain.Config(), parent.Header())
-		if !chain.Config().IsLondon(parent.Number()) {
+	if cfg.Genesis.Config.IsLondon(header.Number) {
+		header.BaseFee = misc.CalcBaseFee(cfg.Genesis.Config, parent.Header())
+		if !cfg.Genesis.Config.IsLondon(parent.Number()) {
 			parentGasLimit := parent.GasLimit() * params.ElasticityMultiplier
 			header.GasLimit = core.CalcGasLimit(parentGasLimit, parentGasLimit)
 		}
